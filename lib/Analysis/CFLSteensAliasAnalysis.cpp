@@ -202,7 +202,7 @@ CFLSteensAAResult::FunctionInfo CFLSteensAAResult::buildSetsFrom(Function *Fn) {
       SetBuilder.noteAttributes(InstantiatedValue{Val, I + 1},
                                 ValueInfo.getNodeInfoAtLevel(I + 1).Attr);
       SetBuilder.addBelow(InstantiatedValue{Val, I},
-                          InstantiatedValue{Val, I + 1});
+    InstantiatedValue{Val, I + 1});
     }
   }
 
