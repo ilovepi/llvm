@@ -113,6 +113,49 @@ bool isUseArcTest(const Function *F) {
   return 0 == std::strncmp(name, UseArcTestName, strlen(UseArcTestName));
 }
 
+struct ArgStatus {
+  bool ReachesUntrustedAPI;
+  bool AliasesReturn;
+  bool AliasesGlobal;
+};
+
+struct FuncSummary {
+  Function *Func;
+  DenseMap<Argument *, ArgStatus> ParamList;
+};
+
+FuncSummary createFuncSummary(Function *F, CFLAndersAAResult &AA) {
+  FuncSummary summary;
+  summary.Func = F;
+  for (Argument &Arg : F->args()) {
+    ArgStatus stat = {0};
+    // stat.AliasesReturn = does
+  }
+  return summary;
+}
+
+class ReachableScc {
+public:
+  CallGraphSCC Node;
+  std::set<CallGraphNode *> DirectCalls;
+  std::set<CallGraphNode *> IndirectCalls;
+  std::set<Function *> SccMembers;
+
+  // constructor
+  ReachableScc(CallGraphSCC node, std::set<CallGraphNode *> direct,
+               std::set<CallGraphNode *> indirect, std::set<Function *> members)
+      : Node(node), DirectCalls(direct), IndirectCalls(indirect),
+        SccMembers(members) {}
+
+  // copy constructor
+  ReachableScc(const ReachableScc &other)
+      : Node(other.Node), DirectCalls(other.DirectCalls),
+        IndirectCalls(other.IndirectCalls), SccMembers(other.SccMembers) {}
+
+  // destructor
+  ~ReachableScc() = default;
+};
+
 class UntrustedAlloc : public ModulePass {
 
   enum IsReachable { None, NotReachable, Reachable };
@@ -127,7 +170,7 @@ class UntrustedAlloc : public ModulePass {
   using VisitedStat = DenseMap<Function *, int>;
   using CheckedFunMap = DenseMap<CallGraphNode *, bool>;
 
-  bool debug = true;
+  bool debug = false;
 
 public:
   /// pass identification
@@ -175,7 +218,8 @@ public:
                    << " __rust_alloc() call sites\n";
     }
 
-    scanCG(M);
+    // scanCG(M);
+    // preprocessCallGraph();
 
     bool MultipleVisits = false;
     for (auto &F : M) {
@@ -199,7 +243,7 @@ public:
     //}
     //}
 
-    // handleExchangeMalloc();
+    handleExchangeMalloc();
     // handleRustAlloc();
     return found;
   }
@@ -289,7 +333,7 @@ public:
       ++CGI;
       if (!CurSCC.isSingular()) {
         for (CallGraphNode *SCCNode : CurSCC) {
-          //SCCNode->dump();
+          // SCCNode->dump();
         }
         return;
       }
@@ -317,9 +361,11 @@ public:
             errs() << "\n##########################################\n";
             errs() << CGNode->getFunction()->getName() << " Calls:\n";
             for (auto *Node : visited_nodes) {
-              if(!Node)continue;
+              if (!Node)
+                continue;
               auto F = Node->getFunction();
-              if(!F)continue;
+              if (!F)
+                continue;
               errs() << F->getName() << " \n";
             }
             errs() << "\n##########################################\n";
@@ -328,9 +374,11 @@ public:
             errs() << "\n##########################################\n";
             errs() << CGNode->getFunction()->getName() << " Calls:\n";
             for (auto *Node : external_nodes) {
-              if(!Node)continue;
+              if (!Node)
+                continue;
               auto F = Node->getFunction();
-              if(!F)continue;
+              if (!F)
+                continue;
               errs() << F->getName() << " \n";
             }
             errs() << "\n#################  external_nodes  "
@@ -525,20 +573,32 @@ public:
 
   // find if value escapes current function
   bool doesValEscape(Value *V, Function *F, CFLAndersAAResult &AA) {
+    // TODO: Also check Globals
+    return doesValAliasAnyArg(V, F, AA) || doesValAliasRet(V, F, AA);
+  }
+
+  bool doesValAliasArg(Value *V, Argument *Arg, Function *F, CFLAndersAAResult &AA) {
     MemoryLocation ValLoc(V, LocationSize::unknown());
-    // TODO: Figure out if there are other possible return paths/values
+    MemoryLocation ArgLoc(Arg, LocationSize::unknown());
+    return AA.alias(ValLoc, ArgLoc);
+  }
+
+  bool doesValAliasAnyArg(Value *V, Function *F, CFLAndersAAResult &AA) {
+    MemoryLocation ValLoc(V, LocationSize::unknown());
     if (F->returnDoesNotAlias() || F->hasStructRetAttr()) {
       for (Argument &Arg : F->args()) {
-        MemoryLocation RetLoc(&Arg, LocationSize::unknown());
-        // MemoryLocation RetLoc = MemoryLocation::get(RetVal);
-        // errs() << "Created Memory location for Return Value\n";
-        if (AA.alias(ValLoc, RetLoc))
+        if (doesValAliasArg(V, &Arg, F, AA))
           return true;
       }
-      // if we got here there may be an issue
+
       if (debug)
         debugPrintArgAliases(ValLoc, F, AA);
     } // end ret parameter check
+    return false;
+  }
+
+  bool doesValAliasRet(Value *V, Function *F, CFLAndersAAResult &AA) {
+    MemoryLocation ValLoc(V, LocationSize::unknown());
 
     // errs() << "Created Memory location for target value\n";
     for (auto &BB : *F) {
@@ -554,7 +614,6 @@ public:
         } // end if RetVal
       }   // end if RetInst
     }     // end forloop
-
     return false;
   }
 
@@ -759,6 +818,147 @@ public:
         checkParentCallSite(F, ArgNum);
       }
     }
+  }
+
+  // Preprocess Call graph marking functions which cannot possibly reach
+  // untrusted APIs
+  void preprocessCallGraph() {
+    // get callgraph
+    CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+
+    // external node
+    auto ExtNode = CG.getExternalCallingNode();
+
+    // get scc iterator for call graph
+    auto it_scc_begin = scc_begin(&CG);
+    auto it_scc_end = scc_end(&CG);
+    // auto scc_it = it_scc_begin;
+    scc_iterator<CallGraph *> CGI = scc_begin(&CG);
+
+    std::vector<CallGraphSCC> SccNodesRPO;
+
+    // store all SCCs in a vector
+    while (!CGI.isAtEnd()) {
+      // Copy the current SCC and increment past it so that the pass can hack
+      // on the SCC if it wants to without invalidating our iterator.
+
+      CallGraphSCC CurSCC(CG, &CGI);
+
+      const std::vector<CallGraphNode *> &NodeVec = *CGI;
+      CurSCC.initialize(NodeVec);
+      SccNodesRPO.push_back(CurSCC);
+      ++CGI;
+    }
+
+    // reverse the vector
+    //
+    // use a copy because someting in CallGraphSCC is const, and swap breaks
+    // ... fun
+    std::vector<CallGraphSCC> SccNodes(SccNodesRPO.rbegin(),
+                                       SccNodesRPO.rend());
+
+    std::vector<ReachableScc> reachable;
+    reachable.reserve(SccNodes.size());
+
+    // process the vector
+
+    // for each SCC in vector
+    for (auto SCC : SccNodes) {
+      std::set<CallGraphNode *> DirectCalls;
+      std::set<CallGraphNode *> IndirectCalls;
+      std::set<Function *> SccMembers;
+
+      for (CallGraphNode *CGN : SCC) {
+        auto F = CGN->getFunction();
+        if (F) {
+          SccMembers.insert(F);
+        }
+      }
+
+      for (CallGraphNode *CGN : SCC) {
+        auto F = CGN->getFunction();
+
+        for (auto &CR : *CGN) {
+          auto CalledNode = CR.second;
+          auto Called = CalledNode->getFunction();
+
+          if (Called) {
+            bool inScc = SccMembers.find(Called) != SccMembers.end();
+
+            // only add functions outside of the SCC to the analysis
+            if (inScc) {
+              DirectCalls.insert(CGN);
+            }
+          }
+        }
+        for (auto F : SccMembers) {
+          // if F makes indirect calls add them to indirect call list
+          for (auto &BB : *F) {
+            for (auto &I : BB) {
+              CallSite CS(&I);
+              if (CS && CS.isIndirectCall()) {
+                auto TyPtr = CS.getCalledValue()->getType();
+                FunctionType *FTy = cast<FunctionType>(
+                    cast<PointerType>(TyPtr)->getElementType());
+                if (FTy) {
+                  // scan external node for matches
+                  auto NewIndirectCalls = scanExternalNode(FTy, ExtNode);
+                  IndirectCalls.insert(NewIndirectCalls.begin(),
+                                       NewIndirectCalls.end());
+                } // end if Fty
+              }   // end if isIndirectCall()
+            }     // end for each Instruction
+          }       // end for each BB
+        }         // end indirect call search
+
+      } // end for each F in SCC
+
+      reachable.emplace_back(SCC, DirectCalls, IndirectCalls, SccMembers);
+    } // end iteration through all SCCs
+
+    for (auto RScc : reachable) {
+      bool found = false;
+      for (CallGraphNode *CGN : RScc.DirectCalls) {
+        std::set<CallGraphNode *> visited_nodes;
+        found |= sadDFS(CGN, visited_nodes, ExtNode);
+        if (found)
+          break;
+      } // end for all indirect calls
+
+      if (!found) {
+        for (CallGraphNode *CGN : RScc.IndirectCalls) {
+          std::set<CallGraphNode *> visited_nodes;
+          found |= sadDFS(CGN, visited_nodes, ExtNode);
+          if (found)
+            break;
+        } // end for all indirect calls
+      }   // end if not found
+
+      IsReachable reach = found ? IsReachable::None : IsReachable::NotReachable;
+      for (auto F : RScc.SccMembers) {
+        for (auto &A : F->args()) {
+          QueryKey key = std::make_pair(F, &A);
+          QCache[key] = reach;
+        } // end for all args in function
+      }   // end for all functions in SCC
+
+    } // end for component in sccs
+  }   // end function preprocesscallgraph()
+
+  std::vector<CallGraphNode *> scanExternalNode(FunctionType *FTy,
+                                                CallGraphNode *ExtNode) {
+    std::vector<CallGraphNode *> ret;
+    for (auto Node : *ExtNode) {
+      auto CGN = Node.second;
+      auto F = CGN->getFunction();
+      if (F) {
+        FunctionType *TargetTy = F->getFunctionType();
+        if (TargetTy == FTy) {
+          ret.push_back(CGN);
+        }
+      }
+    }
+    return ret;
   }
 
   void queryCallee(Function *F) {
